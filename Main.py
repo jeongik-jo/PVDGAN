@@ -11,12 +11,12 @@ import matplotlib.pyplot as plt
 
 
 def train_gan():
-    encoder = Models.Encoder()
-    decoder = Models.Decoder()
-    discriminator = Models.Discriminator()
+    enc = Models.Encoder()
+    dec = Models.Decoder()
+    dis = Models.Discriminator()
 
     if hp.load_model:
-        encoder.load(), decoder.load(), discriminator.load()
+        enc.load(), dec.load(), dis.load()
 
     train_dataset = Dataset.load_train_dataset()
     test_dataset = Dataset.load_test_dataset()
@@ -27,32 +27,31 @@ def train_gan():
         print('epoch', epoch)
         start = time.time()
 
-        train_results = Train.train(encoder.model, decoder.model, discriminator.model,
-                                    decoder.latent_var_trace, train_dataset)
+        train_results = Train.train(enc.model, dec.model, dis.model, train_dataset)
         print('saving...')
-        encoder.to_ema()
-        decoder.to_ema()
-        encoder.save()
-        decoder.save()
-        discriminator.save()
-        decoder.save_images(encoder.model, test_dataset, epoch)
+        enc.to_ema()
+        dec.to_ema()
+        enc.save()
+        dec.save()
+        dis.save()
+        dec.save_imgs(enc.model, Dataset.load_sample_dataset(), epoch)
         print('saved')
         print('time: ', time.time() - start, '\n')
 
-        if hp.evaluate_model and (epoch + 1) % hp.epoch_per_evaluate == 0:
+        if hp.eval_model and (epoch + 1) % hp.epoch_per_eval == 0:
             print('evaluating...')
             start = time.time()
-            evaluate_results = Evaluate.evaluate(encoder.model, decoder.model, decoder.latent_var_trace, test_dataset)
+            eval_results = Evaluate.eval(enc.model, dec.model, test_dataset)
             for key in train_results:
                 try:
                     results[key].append(train_results[key])
                 except KeyError:
                     results[key] = [train_results[key]]
-            for key in evaluate_results:
+            for key in eval_results:
                 try:
-                    results[key].append(evaluate_results[key])
+                    results[key].append(eval_results[key])
                 except KeyError:
-                    results[key] = [evaluate_results[key]]
+                    results[key] = [eval_results[key]]
 
             print('evaluated')
             print('time: ', time.time() - start, '\n')
@@ -63,12 +62,13 @@ def train_gan():
                 plt.title(key)
                 plt.xlabel('Epochs')
                 plt.ylabel(key)
-                plt.plot([(i + 1) * hp.epoch_per_evaluate for i in range(len(results[key]))], results[key])
+                plt.plot([(i + 1) * hp.epoch_per_eval for i in range(len(results[key]))], results[key])
                 plt.savefig('results/figures/%s.png' % key)
                 plt.clf()
 
-        encoder.to_train()
-        decoder.to_train()
+        enc.to_train()
+        dec.to_train()
+
 
 train_gan()
 

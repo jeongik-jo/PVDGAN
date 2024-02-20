@@ -3,41 +3,52 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import tensorflow as tf
 from tensorflow import keras as kr
 
-enc_opt = kr.optimizers.Adam(learning_rate=0.002, beta_1=0.0, beta_2=0.99)
-enc_ema = tf.train.ExponentialMovingAverage(decay=0.999)
-dec_opt = kr.optimizers.Adam(learning_rate=0.002, beta_1=0.0, beta_2=0.99)
-dec_ema = tf.train.ExponentialMovingAverage(decay=0.999)
+enc_opt = kr.optimizers.Adam(learning_rate=0.003, beta_1=0.0, beta_2=0.99,
+                             use_ema=True, ema_momentum=0.999, ema_overwrite_frequency=None)
+dec_opt = kr.optimizers.Adam(learning_rate=0.003, beta_1=0.0, beta_2=0.99,
+                             use_ema=True, ema_momentum=0.999, ema_overwrite_frequency=None)
 
-image_resolution = 256
-latent_dim = 1024
+is_ffhq = False
+img_res = 256
+img_chn = 3
+ltn_dim = 1024
 
-reg_weight = 3.0
-image_rec_weight = 1.0
+reg_w = 3.0
+img_rec_w = 1.0
+rec_is_perceptual = True
 is_dls = True
+ltn_var_trace = tf.Variable(tf.ones([ltn_dim]) * 0.0001, name='ltn_var_trace', trainable=False)
 if is_dls:
-    latent_rec_weight = 1.0
-    use_image_rec = True
-    latent_var_decay_rate = 0.999
+    ltn_rec_w = 1.0
+    use_logvar = False
+    is_pvd = True
+    ltn_var_decay_rate = 0.999
 else:
-    prior_weight = 1.0
-    dis_opt = kr.optimizers.Adam(learning_rate=0.002, beta_1=0.0, beta_2=0.99)
+    prr_w = 1.0
+    dis_opt = kr.optimizers.Adam(learning_rate=0.003, beta_1=0.0, beta_2=0.99)
 
 batch_size = 8
-save_image_size = 8
 
 train_data_size = -1
 test_data_size = -1
-shuffle_test_dataset = False
 epochs = 100
 
 load_model = False
 
-evaluate_model = True
-fid_batch_size = batch_size
-epoch_per_evaluate = 1
+eval_model = True
+epoch_per_eval = 1
 
 
-def latent_dist_func(batch_size):
-    return tf.random.normal([batch_size, latent_dim])
+def ltn_dist_func(batch_size):
+    return tf.random.normal([batch_size, ltn_dim])
 
-latent_interpolation_value = 2.0
+
+def get_ltn_scl_vecs():
+    return tf.sqrt(tf.cast(ltn_dim, 'float32') * ltn_var_trace / tf.reduce_sum(ltn_var_trace))[tf.newaxis]
+
+
+def get_ltn_ent():
+    return tf.reduce_sum(tf.math.log(get_ltn_scl_vecs() * tf.sqrt(2.0 * 3.141592 * tf.exp(1.0))))
+
+
+ltn_int_val = 2.0

@@ -4,116 +4,135 @@ import HyperParameters as hp
 
 
 @tf.function
-def _dlsgan_train_step(encoder: kr.Model, decoder: kr.Model, latent_var_trace: tf.Variable, real_images: tf.Tensor):
-    with tf.GradientTape(persistent=True) as tape:
-        real_images = tf.image.random_flip_left_right(real_images)
-        batch_size = real_images.shape[0]
-        latent_dim = tf.cast(hp.latent_dim, 'float32')
-        latent_scale_vector = tf.sqrt(latent_dim * latent_var_trace / tf.reduce_sum(latent_var_trace))
+def _dlsgan_train_step(enc: kr.Model, dec: kr.Model, real_imgs: tf.Tensor):
+    ltn_scl_vecs = hp.get_ltn_scl_vecs()
+    batch_size = real_imgs.shape[0]
+    half_batch_size = batch_size // 2
 
+    ltn_vecs = hp.ltn_dist_func(batch_size)
+    fake_imgs = dec(ltn_vecs * ltn_scl_vecs)
+
+    with tf.GradientTape() as enc_tape:
         with tf.GradientTape() as reg_tape:
-            reg_tape.watch(real_images)
-            real_adv_values, real_latent_vectors, _, real_feature_vectors = encoder(real_images)
-        reg_loss = tf.reduce_mean(tf.reduce_sum(tf.square(reg_tape.gradient(real_adv_values, real_images)), axis=[1, 2, 3]))
+            reg_tape.watch(real_imgs)
+            real_adv_vals, real_ltn_vecs, _, real_ftr_vecs = enc(real_imgs)
+        reg_loss = tf.reduce_mean(tf.reduce_sum(tf.square(reg_tape.gradient(real_adv_vals, real_imgs)), axis=[1, 2, 3]))
+        fake_adv_vals, rec_ltn_vecs, rec_ltn_logvars, _ = enc(fake_imgs)
 
-        if hp.use_image_rec:
-            half_batch_size = batch_size // 2
-            latent_vectors = tf.concat([hp.latent_dist_func(half_batch_size),
-                                        tf.stop_gradient(real_latent_vectors[half_batch_size:]) +
-                                        hp.latent_dist_func(half_batch_size) * tf.sqrt(tf.nn.relu(1 - latent_var_trace))[tf.newaxis]], axis=0)
-            fake_images = decoder(latent_vectors * latent_scale_vector[tf.newaxis])
-            fake_adv_values, rec_latent_vectors, _, rec_feature_vectors = encoder(fake_images)
-            image_rec_loss = tf.reduce_mean(tf.square(rec_feature_vectors[half_batch_size:] - real_feature_vectors[half_batch_size:]))
+        ltn_rec_diff = tf.square((ltn_vecs - rec_ltn_vecs) * ltn_scl_vecs)
+        rec_ltn_traces = rec_ltn_vecs
+
+        if hp.use_logvar:
+            ltn_rec_loss = tf.reduce_mean(rec_ltn_logvars + ltn_rec_diff / (tf.exp(rec_ltn_logvars) + 1e-7))
         else:
-            latent_vectors = hp.latent_dist_func(batch_size)
-            fake_images = decoder(latent_vectors * latent_scale_vector[tf.newaxis])
-            fake_adv_values, rec_latent_vectors, _, _ = encoder(fake_images)
-            image_rec_loss = 0.0
-        latent_rec_loss = tf.reduce_mean(tf.square((latent_vectors - rec_latent_vectors) * latent_scale_vector[tf.newaxis]))
+            ltn_rec_loss = tf.reduce_mean(ltn_rec_diff)
 
-        dis_adv_loss = tf.reduce_mean(tf.nn.softplus(-real_adv_values) + tf.nn.softplus(fake_adv_values))
-        gen_adv_loss = tf.reduce_mean(tf.nn.softplus(-fake_adv_values))
+        dis_adv_loss = tf.reduce_mean(tf.nn.softplus(-real_adv_vals) + tf.nn.softplus(fake_adv_vals))
+        enc_loss = dis_adv_loss + hp.ltn_rec_w * ltn_rec_loss + hp.reg_w * reg_loss
 
-        enc_loss = dis_adv_loss + hp.latent_rec_weight * latent_rec_loss + hp.reg_weight * reg_loss
-        dec_loss = gen_adv_loss + hp.latent_rec_weight * latent_rec_loss + hp.image_rec_weight * image_rec_loss
+    hp.enc_opt.minimize(enc_loss, enc.trainable_variables, tape=enc_tape)
 
-    hp.enc_opt.apply_gradients(
-        zip(tape.gradient(enc_loss, encoder.trainable_variables),
-            encoder.trainable_variables)
-    )
-    hp.dec_opt.apply_gradients(
-        zip(tape.gradient(dec_loss, decoder.trainable_variables),
-            decoder.trainable_variables)
-    )
+    if hp.is_pvd:
+        ltn_vecs = tf.concat([
+            real_ltn_vecs[:half_batch_size] + hp.ltn_dist_func(half_batch_size) * tf.sqrt(tf.nn.relu(1 - hp.ltn_var_trace))[tf.newaxis],
+            hp.ltn_dist_func(half_batch_size)
+        ], axis=0)
 
-    hp.enc_ema.apply(encoder.trainable_variables)
-    hp.dec_ema.apply(decoder.trainable_variables)
-    latent_var_trace.assign(latent_var_trace * hp.latent_var_decay_rate +
-                            tf.reduce_mean(tf.square(rec_latent_vectors), axis=0) * (1.0 - hp.latent_var_decay_rate))
+    else:
+        ltn_vecs = hp.ltn_dist_func(batch_size)
+
+    with tf.GradientTape() as dec_tape:
+        fake_imgs = dec(ltn_vecs * ltn_scl_vecs)
+        fake_adv_vals, rec_ltn_vecs, rec_ltn_logvars, rec_ftr_vecs = enc(fake_imgs)
+
+        if hp.is_pvd:
+            img_rec_loss = tf.reduce_mean(tf.square((rec_ftr_vecs - real_ftr_vecs)[:half_batch_size]))
+            ltn_rec_diff = tf.square((ltn_vecs - rec_ltn_vecs)[half_batch_size:] * ltn_scl_vecs)
+            rec_ltn_logvars = rec_ltn_logvars[half_batch_size:]
+            rec_ltn_traces = tf.concat([rec_ltn_traces, rec_ltn_vecs[half_batch_size:]], axis=0)
+        else:
+            img_rec_loss = tf.constant(0.0)
+            ltn_rec_diff = tf.square((ltn_vecs - rec_ltn_vecs) * ltn_scl_vecs)
+            rec_ltn_traces = tf.concat([rec_ltn_traces, rec_ltn_vecs], axis=0)
+
+        if hp.use_logvar:
+            ltn_rec_loss = tf.reduce_mean(rec_ltn_logvars + ltn_rec_diff / (tf.exp(rec_ltn_logvars) + 1e-7))
+        else:
+            ltn_rec_loss = tf.reduce_mean(ltn_rec_diff)
+
+        gen_adv_loss = tf.reduce_mean(tf.nn.softplus(-fake_adv_vals))
+        dec_loss = gen_adv_loss + hp.ltn_rec_w * ltn_rec_loss + hp.img_rec_w * img_rec_loss
+
+    hp.dec_opt.minimize(dec_loss, dec.trainable_variables, tape=dec_tape)
+
+    hp.ltn_var_trace.assign(hp.ltn_var_trace * hp.ltn_var_decay_rate +
+                            tf.reduce_mean(tf.square(rec_ltn_traces), axis=0) * (1.0 - hp.ltn_var_decay_rate))
 
     results = {
-        'real_adv_values': real_adv_values, 'fake_adv_values': fake_adv_values,
-        'reg_loss': reg_loss, 'latent_rec_loss': latent_rec_loss, 'image_rec_loss': image_rec_loss,
+        'real_adv_val': tf.reduce_mean(real_adv_vals), 'fake_adv_val': tf.reduce_mean(fake_adv_vals),
+        'reg_loss': reg_loss, 'ltn_rec_loss': ltn_rec_loss, 'img_rec_loss': img_rec_loss,
     }
     return results
+
 
 @tf.function
-def _vaegan_train_step(encoder: kr.Model, decoder: kr.Model, discriminator: kr.Model, real_images: tf.Tensor):
-    with tf.GradientTape(persistent=True) as tape:
-        real_images = tf.image.random_flip_left_right(real_images)
-        batch_size = real_images.shape[0]
-        half_batch_size = batch_size // 2
+def _vaegan_train_step(enc: kr.Model, dec: kr.Model, dis: kr.Model, real_imgs: tf.Tensor):
+    batch_size = real_imgs.shape[0]
+    half_batch_size = batch_size // 2
 
+    _, ltn_means, ltn_logvars, _ = enc(real_imgs[half_batch_size:])
+    ltn_vecs = tf.concat([
+        hp.ltn_dist_func(half_batch_size),
+        hp.ltn_dist_func(half_batch_size) * tf.exp(ltn_logvars / 2) + ltn_means
+    ], axis=0)
+    fake_imgs = dec(ltn_vecs)
+
+    with tf.GradientTape() as dis_tape:
         with tf.GradientTape() as reg_tape:
-            reg_tape.watch(real_images)
-            real_adv_values, _, _, real_feature_vectors = discriminator(real_images)
-        reg_loss = tf.reduce_mean(tf.reduce_sum(tf.square(reg_tape.gradient(real_adv_values, real_images)), axis=[1, 2, 3]))
+            reg_tape.watch(real_imgs)
+            real_adv_vals, _, _, real_ftr_vecs = dis(real_imgs)
+        reg_loss = tf.reduce_mean(tf.reduce_sum(tf.square(reg_tape.gradient(real_adv_vals, real_imgs)), axis=[1, 2, 3]))
+        fake_adv_vals, _, _, _ = dis(fake_imgs)
+        dis_adv_loss = tf.reduce_mean(tf.nn.softplus(-real_adv_vals) + tf.nn.softplus(fake_adv_vals))
+        dis_loss = dis_adv_loss + hp.reg_w * reg_loss
 
-        _, latent_means, latent_log_vars, _ = encoder(real_images[half_batch_size:])
-        latent_vectors = tf.concat([hp.latent_dist_func(half_batch_size),
-                                    hp.latent_dist_func(half_batch_size) * tf.exp(latent_log_vars / 2) + latent_means], axis=0)
-        fake_images = decoder(latent_vectors)
-        fake_adv_values, _, _, rec_feature_vectors = discriminator(fake_images)
-        image_rec_loss = tf.reduce_mean(tf.square(rec_feature_vectors[half_batch_size:] - real_feature_vectors[half_batch_size:]))
-        prior_loss = tf.reduce_mean(tf.square(latent_means) - latent_log_vars + tf.exp(latent_log_vars))
+    hp.dis_opt.minimize(dis_loss, dis.trainable_variables, tape=dis_tape)
 
-        dis_adv_loss = tf.reduce_mean(tf.nn.softplus(-real_adv_values) + tf.nn.softplus(fake_adv_values))
-        gen_adv_loss = tf.reduce_mean(tf.nn.softplus(-fake_adv_values))
+    with tf.GradientTape(persistent=True) as gen_tape:
+        _, ltn_means, ltn_logvars, _ = enc(real_imgs[:half_batch_size])
+        prr_loss = tf.reduce_mean(tf.square(ltn_means) - ltn_logvars + tf.exp(ltn_logvars))
 
-        enc_loss = hp.image_rec_weight * image_rec_loss + hp.prior_weight * prior_loss
-        dec_loss = gen_adv_loss + hp.image_rec_weight * image_rec_loss
-        dis_loss = dis_adv_loss + hp.reg_weight * reg_loss
+        ltn_vecs = tf.concat([
+            hp.ltn_dist_func(half_batch_size) * tf.exp(ltn_logvars / 2) + ltn_means,
+            hp.ltn_dist_func(half_batch_size)
+        ], axis=0)
 
-    hp.enc_opt.apply_gradients(
-        zip(tape.gradient(enc_loss, encoder.trainable_variables),
-            encoder.trainable_variables)
-    )
-    hp.dec_opt.apply_gradients(
-        zip(tape.gradient(dec_loss, decoder.trainable_variables),
-            decoder.trainable_variables)
-    )
-    hp.dis_opt.apply_gradients(
-        zip(tape.gradient(dis_loss, discriminator.trainable_variables),
-            discriminator.trainable_variables)
-    )
+        fake_imgs = dec(ltn_vecs)
+        fake_adv_vals, _, _, rec_ftr_vecs = dis(fake_imgs)
 
-    hp.enc_ema.apply(encoder.trainable_variables)
-    hp.dec_ema.apply(decoder.trainable_variables)
+        img_rec_loss = tf.reduce_mean(tf.square((rec_ftr_vecs - real_ftr_vecs)[:half_batch_size]))
+        gen_adv_loss = tf.reduce_mean(tf.nn.softplus(-fake_adv_vals))
+
+        enc_loss = hp.img_rec_w * img_rec_loss + hp.prr_w * prr_loss
+        dec_loss = gen_adv_loss + hp.img_rec_w * img_rec_loss
+
+    hp.enc_opt.minimize(enc_loss, enc.trainable_variables, tape=gen_tape)
+    hp.dec_opt.minimize(dec_loss, dec.trainable_variables, tape=gen_tape)
 
     results = {
-        'real_adv_values': real_adv_values, 'fake_adv_values': fake_adv_values,
-        'reg_loss': reg_loss, 'prior_loss': prior_loss, 'image_rec_loss': image_rec_loss,
+        'real_adv_val': tf.reduce_mean(real_adv_vals), 'fake_adv_val': tf.reduce_mean(fake_adv_vals),
+        'reg_loss': reg_loss, 'prr_loss': prr_loss, 'img_rec_loss': img_rec_loss,
     }
     return results
 
 
-def train(encoder: kr.Model, decoder: kr.Model, discriminator: kr.Model, latent_var_trace: tf.Variable, dataset):
+def train(enc: kr.Model, dec: kr.Model, dis: kr.Model, dataset):
     results = {}
     for data in dataset:
         if hp.is_dls:
-            batch_results = _dlsgan_train_step(encoder, decoder, latent_var_trace, data)
+            batch_results = _dlsgan_train_step(enc, dec, data)
         else:
-            batch_results = _vaegan_train_step(encoder, decoder, discriminator, data)
+            batch_results = _vaegan_train_step(enc, dec, dis, data)
         for key in batch_results:
             try:
                 results[key].append(batch_results[key])
@@ -122,12 +141,14 @@ def train(encoder: kr.Model, decoder: kr.Model, discriminator: kr.Model, latent_
 
     temp_results = {}
     for key in results:
-        mean, variance = tf.nn.moments(tf.concat(results[key], axis=0), axes=0)
+        mean, variance = tf.nn.moments(tf.convert_to_tensor(results[key]), axes=0)
         temp_results[key + '_mean'] = mean
         temp_results[key + '_variance'] = variance
+    temp_results['ltn_ent'] = hp.get_ltn_ent()
     results = temp_results
 
     for key in results:
         print('%-30s:' % key, '%13.6f' % results[key].numpy())
 
     return results
+
